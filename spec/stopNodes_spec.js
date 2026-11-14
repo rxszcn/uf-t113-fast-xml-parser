@@ -1,6 +1,7 @@
 "use strict";
 
 import { XMLParser, XMLValidator } from "../src/fxp.js";
+import { Expression } from "path-expression-matcher";
 
 describe("XMLParser StopNodes", function () {
   it("should support single stopNode with namespace and removeNSPrefix set", function () {
@@ -472,5 +473,241 @@ describe("XMLParser StopNodes", function () {
     // console.log(JSON.stringify(result, null, 4));
     expect(result).toEqual(expected);
 
+  });
+
+  describe("attribute-filtered stopNodes across attribute configurations", function () {
+    // Shared document: two divs distinguishable only by their class attribute,
+    // plus two sections distinguishable only by a boolean attribute.
+    const xmlData = `
+      <root>
+        <div class="code"><pre>should stop</pre></div>
+        <div class="text"><pre>should NOT stop</pre></div>
+        <section flagged><p>flagged section stops</p></section>
+        <section><p>plain section keeps parsing</p></section>
+      </root>`;
+
+    it("matches an attribute-value filter under default config via string path", function () {
+      const parser = new XMLParser({
+        stopNodes: ["..div[class=code]"]
+      });
+      expect(parser.parse(xmlData)).toEqual({
+        "root": {
+          "div": [
+            "<pre>should stop</pre>",
+            { "pre": "should NOT stop" }
+          ],
+          "section": [
+            { "p": "flagged section stops" },
+            { "p": "plain section keeps parsing" }
+          ]
+        }
+      });
+    });
+
+    it("matches an attribute-value filter under default config via Expression", function () {
+      const parser = new XMLParser({
+        stopNodes: [new Expression("..div[class=code]")]
+      });
+      expect(parser.parse(xmlData)).toEqual({
+        "root": {
+          "div": [
+            "<pre>should stop</pre>",
+            { "pre": "should NOT stop" }
+          ],
+          "section": [
+            { "p": "flagged section stops" },
+            { "p": "plain section keeps parsing" }
+          ]
+        }
+      });
+    });
+
+    it("matches an attribute-presence filter under default config", function () {
+      const parser = new XMLParser({
+        allowBooleanAttributes: true,
+        stopNodes: ["..section[flagged]"]
+      });
+      expect(parser.parse(xmlData)).toEqual({
+        "root": {
+          "div": [
+            { "pre": "should stop" },
+            { "pre": "should NOT stop" }
+          ],
+          "section": [
+            "<p>flagged section stops</p>",
+            { "p": "plain section keeps parsing" }
+          ]
+        }
+      });
+    });
+
+    it("matches an exact (non deep-wildcard) attribute filter under default config", function () {
+      const xml = `<root><item type="x"><a>1</a></item><item type="y"><a>2</a></item></root>`;
+      const parser = new XMLParser({
+        stopNodes: ["root.item[type=x]"]
+      });
+      expect(parser.parse(xml)).toEqual({
+        "root": {
+          "item": ["<a>1</a>", { "a": 2 }]
+        }
+      });
+    });
+
+    it("keeps the matched subtree raw when attributes are explicitly emitted", function () {
+      const parser = new XMLParser({
+        ignoreAttributes: false,
+        attributeNamePrefix: "@_",
+        stopNodes: ["..div[class=code]", "..section[flagged]"]
+      });
+      expect(parser.parse(xmlData)).toEqual({
+        "root": {
+          "div": [
+            { "#text": "<pre>should stop</pre>", "@_class": "code" },
+            { "pre": "should NOT stop", "@_class": "text" }
+          ],
+          // The boolean attribute stays out of the tree unless
+          // allowBooleanAttributes is enabled, but the presence filter still
+          // matches, so the subtree collapses to its raw text.
+          "section": [
+            "<p>flagged section stops</p>",
+            { "p": "plain section keeps parsing" }
+          ]
+        }
+      });
+    });
+
+    it("emits boolean attributes alongside the raw subtree when explicitly enabled", function () {
+      const parser = new XMLParser({
+        ignoreAttributes: false,
+        allowBooleanAttributes: true,
+        attributeNamePrefix: "@_",
+        stopNodes: ["..section[flagged]"]
+      });
+      expect(parser.parse(xmlData)).toEqual({
+        "root": {
+          // Non-matching nodes keep their normal parsed form, attributes included.
+          "div": [
+            { "pre": "should stop", "@_class": "code" },
+            { "pre": "should NOT stop", "@_class": "text" }
+          ],
+          "section": [
+            { "#text": "<p>flagged section stops</p>", "@_flagged": true },
+            { "p": "plain section keeps parsing" }
+          ]
+        }
+      });
+    });
+
+    it("produces the same stop-node decision under default and explicit attribute configs", function () {
+      const stopNodes = ["..div[class=code]", "..section[flagged]"];
+
+      const defaultResult = new XMLParser({ stopNodes }).parse(xmlData);
+      const explicitResult = new XMLParser({
+        ignoreAttributes: false,
+        allowBooleanAttributes: true,
+        stopNodes
+      }).parse(xmlData);
+
+      // A stop node keeps its raw subtree either as a bare string (attributes
+      // ignored) or as an object whose #text holds that same raw string.
+      const rawText = (node) => (typeof node === "string" ? node : node["#text"]);
+
+      // The SAME nodes are selected as stop nodes under both configs...
+      expect(rawText(defaultResult.root.div[0])).toBe("<pre>should stop</pre>");
+      expect(rawText(explicitResult.root.div[0])).toBe("<pre>should stop</pre>");
+      expect(rawText(defaultResult.root.section[0])).toBe("<p>flagged section stops</p>");
+      expect(rawText(explicitResult.root.section[0])).toBe("<p>flagged section stops</p>");
+
+      // ...and the preserved raw text is byte-identical across configs.
+      expect(rawText(explicitResult.root.div[0])).toBe(rawText(defaultResult.root.div[0]));
+      expect(rawText(explicitResult.root.section[0])).toBe(rawText(defaultResult.root.section[0]));
+
+      // Non-matching subtrees keep being parsed structurally in both configs.
+      expect(defaultResult.root.div[1]).toEqual({ "pre": "should NOT stop" });
+      expect(explicitResult.root.div[1]["pre"]).toBe("should NOT stop");
+      expect(defaultResult.root.section[1]).toEqual({ "p": "plain section keeps parsing" });
+      expect(explicitResult.root.section[1]["p"]).toBe("plain section keeps parsing");
+
+      // The explicit config additionally surfaces the matched attributes,
+      // without changing the stop decision.
+      expect(explicitResult.root.div[0]["@_class"]).toBe("code");
+      expect(explicitResult.root.section[0]["@_flagged"]).toBe(true);
+      expect(defaultResult.root.div[0]["@_class"]).toBeUndefined();
+    });
+
+    it("does not match when the attribute name or value differs, under default config", function () {
+      const parser = new XMLParser({
+        stopNodes: ["..div[class=missing]", "..section[absent]"]
+      });
+      expect(parser.parse(xmlData)).toEqual({
+        "root": {
+          "div": [
+            { "pre": "should stop" },
+            { "pre": "should NOT stop" }
+          ],
+          "section": [
+            { "p": "flagged section stops" },
+            { "p": "plain section keeps parsing" }
+          ]
+        }
+      });
+    });
+
+    it("handles self-closing stop nodes selected by an attribute filter", function () {
+      const xml = `<root><script src="a.js"/><script src="b.js">x()</script></root>`;
+
+      const defaultParser = new XMLParser({ stopNodes: ["..script[src]"] });
+      expect(defaultParser.parse(xml)).toEqual({
+        "root": { "script": ["", "x()"] }
+      });
+
+      const explicitParser = new XMLParser({
+        ignoreAttributes: false,
+        stopNodes: ["..script[src]"]
+      });
+      expect(explicitParser.parse(xml)).toEqual({
+        "root": {
+          "script": [
+            { "@_src": "a.js" },
+            { "#text": "x()", "@_src": "b.js" }
+          ]
+        }
+      });
+    });
+
+    it("works with attribute filters in preserveOrder mode under default config", function () {
+      const parser = new XMLParser({
+        preserveOrder: true,
+        stopNodes: ["..div[class=code]"]
+      });
+      expect(parser.parse(xmlData)).toEqual([
+        {
+          "root": [
+            { "div": [{ "#text": "<pre>should stop</pre>" }] },
+            { "div": [{ "pre": [{ "#text": "should NOT stop" }] }] },
+            { "section": [{ "p": [{ "#text": "flagged section stops" }] }] },
+            { "section": [{ "p": [{ "#text": "plain section keeps parsing" }] }] }
+          ]
+        }
+      ]);
+    });
+
+    it("does not regress plain (attribute-free) stopNodes under default config", function () {
+      const parser = new XMLParser({
+        stopNodes: ["..div"]
+      });
+      expect(parser.parse(xmlData)).toEqual({
+        "root": {
+          "div": [
+            "<pre>should stop</pre>",
+            "<pre>should NOT stop</pre>"
+          ],
+          "section": [
+            { "p": "flagged section stops" },
+            { "p": "plain section keeps parsing" }
+          ]
+        }
+      });
+    });
   });
 });

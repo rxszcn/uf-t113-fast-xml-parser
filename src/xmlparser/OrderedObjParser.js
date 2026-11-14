@@ -79,6 +79,7 @@ export default class OrderedObjParser {
     this.parseTextData = parseTextData;
     this.resolveNameSpace = resolveNameSpace;
     this.buildAttributesMap = buildAttributesMap;
+    this.parseRawAttributesForMatcher = parseRawAttributesForMatcher;
     this.isItStopNode = isItStopNode;
     this.replaceEntitiesValue = replaceEntitiesValue;
     this.readStopNodeData = readStopNodeData;
@@ -205,6 +206,45 @@ function attrValue(match) {
   return match[3] !== undefined ? match[3] : match[4];
 }
 
+/**
+ * Parse the raw (un-prefixed) attributes of a tag and sync them into the path
+ * matcher so attribute-based path expressions (e.g. "..div[class=code]") can
+ * match regardless of whether attributes are emitted in the output.
+ *
+ * This runs for every tag carrying an attribute expression, even when
+ * `ignoreAttributes` is true. The matcher only needs the original attribute
+ * names/values for pattern matching; whether they are stored on the result
+ * node is decided separately in buildAttributesMap.
+ * @param {string} attrStr raw attribute expression of the current tag
+ * @param {string} tagName current tag name
+ * @returns {object} map of raw attribute name to processed value
+ */
+function parseRawAttributesForMatcher(attrStr, tagName) {
+  const options = this.options;
+  if (typeof attrStr !== 'string' || attrStr.length === 0) return {};
+
+  const matches = getAllMatches(attrStr, attrsRegx);
+  const rawAttrs = {};
+  for (let i = 0; i < matches.length; i++) {
+    const attrName = this.resolveNameSpace(matches[i][1]);
+    const oldVal = attrValue(matches[i]);
+
+    if (attrName.length) {
+      if (oldVal !== undefined) {
+        let val = oldVal;
+        if (options.trimValues) val = val.trim();
+        val = this.replaceEntitiesValue(val, tagName, this.readonlyMatcher);
+        rawAttrs[attrName] = val;
+      } else {
+        // Valueless (boolean) attribute: presence matching only needs the key
+        // to exist; true is also what the output map stores when allowed.
+        rawAttrs[attrName] = true;
+      }
+    }
+  }
+  return rawAttrs;
+}
+
 function buildAttributesMap(attrStr, jPath, tagName, force = false) {
   const options = this.options;
   if (force === true || (options.ignoreAttributes !== true && typeof attrStr === 'string')) {
@@ -225,14 +265,21 @@ function buildAttributesMap(attrStr, jPath, tagName, force = false) {
       const attrName = this.resolveNameSpace(matches[i][1]);
       const oldVal = attrValue(matches[i]);
 
-      if (attrName.length && oldVal !== undefined) {
-        let val = oldVal;
-        if (options.trimValues) val = val.trim();
-        val = this.replaceEntitiesValue(val, tagName, this.readonlyMatcher);
-        processedVals[i] = val;
+      if (attrName.length) {
+        if (oldVal !== undefined) {
+          let val = oldVal;
+          if (options.trimValues) val = val.trim();
+          val = this.replaceEntitiesValue(val, tagName, this.readonlyMatcher);
+          processedVals[i] = val;
 
-        rawAttrsForMatcher[attrName] = val;
-        hasRawAttrs = true;
+          rawAttrsForMatcher[attrName] = val;
+          hasRawAttrs = true;
+        } else {
+          // Valueless (boolean) attribute: presence-based path expressions
+          // only need the key to exist on the matcher.
+          rawAttrsForMatcher[attrName] = true;
+          hasRawAttrs = true;
+        }
       }
     }
 
@@ -497,6 +544,24 @@ const parseXml = function (xmlData) {
         // Push tag to matcher FIRST (with empty attrs for now) so callbacks see correct path
         if (tagName !== xmlObj.tagname) {
           this.matcher.push(tagName, {}, namespace);
+        }
+
+        // Raw attributes must reach the matcher even when attributes are
+        // ignored (ignoreAttributes is truthy — boolean, array or function),
+        // otherwise attribute-based stopNodes/path expressions silently fail
+        // to match under the default configuration. Output emission stays
+        // controlled solely by ignoreAttributes below. When attributes are
+        // emitted (ignoreAttributes === false), buildAttributesMap further
+        // down performs the same matcher update, so this extra parse is only
+        // needed while attributes are ignored, and only when stopNodes are
+        // actually configured.
+        if (options.ignoreAttributes &&
+          this.stopNodeExpressionsSet.size > 0 &&
+          tagName !== xmlObj.tagname && tagName !== tagExp && attrExpPresent) {
+          const rawAttrsForMatching = this.parseRawAttributesForMatcher(tagExp, tagName);
+          if (Object.keys(rawAttrsForMatching).length > 0) {
+            this.matcher.updateCurrent(rawAttrsForMatching);
+          }
         }
 
         // Now build attributes - callbacks will see correct matcher state
